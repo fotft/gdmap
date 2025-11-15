@@ -1,4 +1,7 @@
-// main.js — полный перевод Processing -> p5.js (WEBGL)
+// main.js — исправленный полный вариант (твой код + баг-фиксы + HUD для меток + world->screen)
+
+
+
 
 // -----------------------------
 // Global state
@@ -37,7 +40,67 @@ let waters = [];
 let iconCache = {};
 
 // -----------------------------
-// Classes
+// Utility: multiply projection * modelview (column-major arrays)
+// -----------------------------
+function multMat4(a, b) {
+  // a and b are length-16 arrays (column-major)
+  const out = new Array(16).fill(0);
+  // out = a * b (matrix multiplication)
+  for (let col = 0; col < 4; col++) {
+    for (let row = 0; row < 4; row++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) {
+        // index in column-major: element(row, col) -> array[col*4 + row]
+        sum += a[k * 4 + row] * b[col * 4 + k];
+      }
+      out[col * 4 + row] = sum;
+    }
+  }
+  return out;
+}
+
+// -----------------------------
+// Convert world (x,y,z) to screen pixels reliably (WEBGL)
+// uses renderer.uPMatrix.mat4 and renderer.uMVMatrix.mat4
+// -----------------------------
+function worldToScreen(x, y, z) {
+  // get current renderer (global mode)
+  const renderer = (typeof this !== 'undefined' && this._renderer) ? this._renderer : (p5 && p5.instance && p5.instance._renderer ? p5.instance._renderer : null);
+  if (!renderer || !renderer.uPMatrix || !renderer.uMVMatrix) {
+    // fallback: mark as offscreen
+    return { x: NaN, y: NaN, z: Infinity };
+  }
+
+  const pMat = renderer.uPMatrix.mat4; // projection (column-major)
+  const mvMat = renderer.uMVMatrix.mat4; // modelview (column-major)
+
+  // MVP = P * MV
+  const mvp = multMat4(pMat, mvMat);
+
+  // multiply vector (column-major usage)
+  // clip-space coords:
+  const nx = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
+  const ny = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
+  const nz = mvp[2] * x + mvp[6] * y + mvp[10] * z + mvp[14];
+  const nw = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
+
+  if (!isFinite(nw) || Math.abs(nw) < 1e-8) {
+    return { x: NaN, y: NaN, z: Infinity };
+  }
+
+  const ndcX = nx / nw;
+  const ndcY = ny / nw;
+  const ndcZ = nz / nw; // depth
+
+  // convert NDC (-1..1) to pixels (0..width, 0..height). note Y flips.
+  const sx = (ndcX * 0.5 + 0.5) * width;
+  const sy = (-ndcY * 0.5 + 0.5) * height;
+
+  return { x: sx, y: sy, z: ndcZ };
+}
+
+// -----------------------------
+// Classes (как в твоём варианте)
 // -----------------------------
 class Point {
   constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
@@ -139,11 +202,26 @@ class Label {
     this.address = address; this.name = name; this.type = type; this.level = level;
     this.x = location.x; this.y = location.y; this.z = location.z;
     this.icon = null;
+    // screen pos will be computed each frame: {x,y,visible}
+    this._screen = { x: 0, y: 0, visible: false };
+
     if (type) {
-      if (iconCache[type]) this.icon = iconCache[type];
-      else {
-        // load image and store; loadImage is safe to call outside preload but may flash
-        this.icon = loadImage('data/' + type + '.png', img => { iconCache[type] = img; }, err => { /* ignore */ });
+      // use preloaded cache if available (preload() sets iconCache[type])
+      if (iconCache[type]) {
+        this.icon = iconCache[type];
+      } else {
+        // fallback: try to load (async). We'll log if missing.
+        try {
+          this.icon = loadImage('data/' + type + '.png',
+            img => { iconCache[type] = img; this.icon = img; },
+            err => {
+              // keep null; warn once
+              console.warn('Label icon not found for type:', type, 'expected path:', 'data/' + type + '.png');
+            }
+          );
+        } catch (e) {
+          console.warn('loadImage failed for label type', type, e);
+        }
       }
     }
     this.clr = this.colorForType(type);
@@ -164,49 +242,36 @@ class Label {
       default: return {r:255,g:255,b:255};
     }
   }
+  // NOTE: Label.show is no longer used to render HUD — rendering is done by draw() HUD code.
   show() {
-    // transform to label position in world, then draw 2D-like icon+text without depth testing
+    // fallback if someone calls it: simple world-space billboard (not used in optimized HUD)
     push();
     translate(this.x, this.y, this.z);
     rotateY(-angleY);
-    rotateX(-angleX);
-    scale(1/zoom);
-
-    // disable depth test
-    if (drawingContext && drawingContext.disable) drawingContext.disable(drawingContext.DEPTH_TEST);
-
+    scale(1 / zoom);
+    if (drawingContext && drawingContext.disable) {
+      try { drawingContext.disable(drawingContext.DEPTH_TEST); } catch(e) {}
+    }
     noStroke();
     fill(this.clr.r, this.clr.g, this.clr.b);
     textSize(17);
     textAlign(CENTER, TOP);
-
-    if (zoom >= 2) {
-      for (let dx = -0.25; dx <= 0.25; dx += 0.25) {
-        for (let dy = -0.25; dy <= 0.25; dy += 0.25) {
-          if (dx !== 0 || dy !== 0) {
-            push(); translate(dx, dy, 0);
-            if (this.icon) text(this.name, 0, this.icon.height - 15); else text(this.name, 0, -15);
-            pop();
-          }
-        }
-      }
-      if (this.icon) text(this.name, 0, this.icon.height - 15); else text(this.name, 0, -15);
-    }
-
-    if (this.icon) {
+    if (this.icon && this.icon.width) {
       imageMode(CENTER);
-      image(this.icon, 0, 0, this.icon.width / 1.5, this.icon.height / 1.5);
+      image(this.icon, 0, 0, this.icon.width/1.5, this.icon.height/1.5);
+      text(this.name, 0, (this.icon.height/1.5) - 6);
+    } else {
+      text(this.name, 0, -6);
     }
-
-    if (drawingContext && drawingContext.enable) drawingContext.enable(drawingContext.DEPTH_TEST);
-
-    scale(zoom);
+    if (drawingContext && drawingContext.enable) {
+      try { drawingContext.enable(drawingContext.DEPTH_TEST); } catch(e) {}
+    }
     pop();
   }
 }
 
 // -----------------------------
-// preload - load JSON and icons referenced in labels
+// preload - load JSON and icons mentioned in labels
 // -----------------------------
 function preload() {
   font = loadFont("data/YandexSansText-Medium.ttf");
@@ -225,7 +290,7 @@ function preload() {
   json_underlays_root = loadJSON('data/underlays.json');
   json_waters_root = loadJSON('data/water.json');
 
-  // pre-load icons mentioned in labels.json (if exists)
+  // Preload icons exactly by label types found in labels.json.
   try {
     let arr = (json_labels_root && (json_labels_root.labels || json_labels_root)) || [];
     let types = {};
@@ -233,11 +298,15 @@ function preload() {
       let t = arr[i].type;
       if (t && !types[t]) {
         types[t] = true;
-        // attempt to preload icon; if missing, loadImage will fail silently
-        iconCache[t] = loadImage('data/' + t + '.png', img => { iconCache[t] = img; }, err => { delete iconCache[t]; });
+        iconCache[t] = loadImage('data/' + t + '.png',
+          img => { iconCache[t] = img; },
+          err => { delete iconCache[t]; console.warn('Missing icon for type (expected):', 'data/' + t + '.png'); }
+        );
       }
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) {
+    console.warn('Failed to pre-load icons from labels.json', e);
+  }
 }
 
 // -----------------------------
@@ -263,6 +332,9 @@ function setup() {
   read_json_roads();
   read_json_underlays();
   read_json_waters();
+
+  // debug: list loaded icons (may be empty until images finish loading)
+  console.log('Icons preloaded:', Object.keys(iconCache));
 }
 
 // -----------------------------
@@ -271,13 +343,33 @@ function setup() {
 function draw() {
   background(43, 52, 85);
 
+  // clamp zoom (avoid extreme values that kill perf)
+  zoom = constrain(zoom, 0.2, 8.0);
+
+  // -------------------------
+  // 3D scene render
+  // -------------------------
   push();
+
+  // same transform order as у тебя: translate screen-origin, scale, rotate, translate offsets
   translate(0, 100, 0);
   scale(zoom);
   rotateX(angleX);
   rotateY(angleY);
   translate(offsetX, 0, offsetZ);
 
+  // -- compute screen positions for labels while transforms are active --
+  // store them in label._screen so HUD can use them after pop()
+  for (let L of labels) {
+    // Use robust worldToScreen that reads current renderer matrices
+    const s = worldToScreen(L.x, L.y, L.z);
+    L._screen.x = s.x;
+    L._screen.y = s.y;
+    // visible if within clip space (-1..1) in z (we use s.z)
+    L._screen.visible = isFinite(s.z) && s.z > -1 && s.z < 1;
+  }
+
+  // draw map layers (same order as раньше)
   drawUnderlays();
   drawGreenAreas();
   drawWaters();
@@ -291,39 +383,91 @@ function draw() {
   drawHospitals();
   drawGovernments();
 
-  pop();
+  pop(); // restores modelView to identity
 
-  // draw labels last (their show disables depth test internally)
-  for (let L of labels) {
-    if (L.level <= zoom) L.show();
+  // -------------------------
+  // 2D HUD render for labels (icons + text)
+  // -------------------------
+  push();
+  resetMatrix();
+  // move origin to top-left to match pixel coordinates returned by worldToScreen
+  translate(-width / 2, -height / 2);
+
+  // disable depth test so HUD always on top
+  if (drawingContext && drawingContext.disable) {
+    try { drawingContext.disable(drawingContext.DEPTH_TEST); } catch (e) {}
   }
+
+  // draw each label using cached screen positions
+  textAlign(CENTER, TOP);
+  for (let L of labels) {
+    if (!L._screen || !L._screen.visible) continue;
+    // check level threshold like original
+    if (L.level > zoom) continue;
+
+    let sx = L._screen.x;
+    let sy = L._screen.y;
+
+    // skip NaN / undefined positions
+    if (!isFinite(sx) || !isFinite(sy)) continue;
+
+    // icon
+    if (L.icon && L.icon.width) {
+      let iw = L.icon.width / 1.5;
+      let ih = L.icon.height / 1.5;
+      imageMode(CORNER);
+      image(L.icon, sx - iw / 2, sy - ih / 2, iw, ih);
+      if (zoom >= 2) {
+        fill(0, 160);
+        textSize(17);
+        text(L.name, sx + 1, sy + ih / 2 + 3 + 1);
+        fill(L.clr.r, L.clr.g, L.clr.b);
+        text(L.name, sx, sy + ih / 2 + 3);
+      }
+    } else {
+      // fallback: draw simple circle + text
+      fill(L.clr.r, L.clr.g, L.clr.b);
+      noStroke();
+      ellipse(sx, sy, 10, 10);
+      if (zoom >= 2) {
+        fill(255);
+        textSize(14);
+        text(L.name, sx, sy + 8);
+      }
+    }
+  }
+
+  // restore depth test
+  if (drawingContext && drawingContext.enable) {
+    try { drawingContext.enable(drawingContext.DEPTH_TEST); } catch (e) {}
+  }
+
+  pop();
 }
 
 // -----------------------------
 // draw layer helpers
 // -----------------------------
-function drawUnderlays() { for (let u of underlays) u.show && u.show(); }
-function drawGreenAreas() { for (let g of green_areas) g.show && g.show(); }
-function drawWaters() { for (let w of waters) w.show && w.show(); }
-function drawParkings() { for (let p of parkings) p.show && p.show(); }
-function drawAlleys() { for (let a of alleys) a.show && a.show(); }
-function drawRailways() { for (let r of railways) r.show && r.show(); }
-function drawRoads() { for (let r of roads) r.show && r.show(); }
-function drawFields() { for (let f of fields) f.show && f.show(); }
-function drawBuildings() { for (let b of buildings) b.show && b.show(); }
-function drawDetalisedBuildings() { for (let d of detalised_buildings) d.show && d.show(); }
-function drawHospitals() { for (let h of hospitals) h.show && h.show(); }
-function drawGovernments() { for (let g of governments) g.show && g.show(); }
+function drawUnderlays() { for (let u of underlays) if (u && u.show) u.show(); }
+function drawGreenAreas() { for (let g of green_areas) if (g && g.show) g.show(); }
+function drawWaters() { for (let w of waters) if (w && w.show) w.show(); }
+function drawParkings() { for (let p of parkings) if (p && p.show) p.show(); }
+function drawAlleys() { for (let a of alleys) if (a && a.show) a.show(); }
+function drawRailways() { for (let r of railways) if (r && r.show) r.show(); }
+function drawRoads() { for (let r of roads) if (r && r.show) r.show(); }
+function drawFields() { for (let f of fields) if (f && f.show) f.show(); }
+function drawBuildings() { for (let b of buildings) if (b && b.show) b.show(); }
+function drawDetalisedBuildings() { for (let d of detalised_buildings) if (d && d.show) d.show(); }
+function drawHospitals() { for (let h of hospitals) if (h && h.show) h.show(); }
+function drawGovernments() { for (let g of governments) if (g && g.show) g.show(); }
 
 // -----------------------------
-// JSON readers
-// (handles both root-array and root-object-with-key cases)
+// JSON readers (unchanged logic)
 // -----------------------------
 function safeArr(root, key) {
   if (!root) return [];
   if (root[key]) return root[key];
   if (Array.isArray(root)) return root;
-  // if root is object with unknown shape, try to find first array value
   for (let k in root) if (Array.isArray(root[k])) return root[k];
   return [];
 }
@@ -474,12 +618,14 @@ function read_json_waters() {
 }
 
 // -----------------------------
-// Input: mouse & touch
+// Input: mouse & touch (исправления)
 // -----------------------------
 
 // DESKTOP: left drag = pan; CTRL + drag = rotate
 function mouseDragged() {
-  if (isTouch) return; // ignore mouse while touch active
+  // If we're currently handling a real touch, ignore mouse drags
+  if (isTouch) return;
+
   let dx = mouseX - pmouseX;
   let dy = mouseY - pmouseY;
   let sensitivity = 1.0 / zoom;
@@ -497,6 +643,7 @@ function mouseDragged() {
 
 // mouseWheel: zoom and keep focus under cursor
 function mouseWheel(event) {
+  // ignore mouse wheel if real touch is active (some devices send both)
   if (isTouch) return;
   let e = (event.delta > 0) ? 1 : -1;
   let oldZoom = zoom;
@@ -526,8 +673,12 @@ let startOffsetX = 0;
 let startOffsetZ = 0;
 let lastAngleBetween = 0;
 
-function touchStarted() {
+function touchStarted(event) {
+  // only treat as touch if touches array actually contains pointers
+  if (!touches || touches.length === 0) return;
+
   isTouch = true;
+
   if (touches.length === 1) {
     touchMode = "pan";
     lastPanX = touches[0].x;
@@ -546,6 +697,9 @@ function touchStarted() {
 }
 
 function touchMoved() {
+  // ensure it's a real touch move
+  if (!touches || touches.length === 0) return false;
+
   if (touchMode === "pan" && touches.length === 1) {
     let dx = touches[0].x - lastPanX;
     let dy = touches[0].y - lastPanZ;
@@ -579,11 +733,10 @@ function touchMoved() {
 }
 
 function touchEnded() {
-  if (touches.length === 0) {
+  if (!touches || touches.length === 0) {
     isTouch = false;
     touchMode = "none";
   } else if (touches.length === 1) {
-    // if one finger left, switch to pan start from current
     touchMode = "pan";
     lastPanX = touches[0].x; lastPanZ = touches[0].y;
     startOffsetX = offsetX; startOffsetZ = offsetZ;
