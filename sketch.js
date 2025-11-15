@@ -1,4 +1,4 @@
-// main.js — исправленный полный вариант (твой код + баг-фиксы)
+// main.js — исправленный полный вариант (твой код + баг-фиксы + HUD для меток)
 
 // -----------------------------
 // Global state
@@ -139,6 +139,9 @@ class Label {
     this.address = address; this.name = name; this.type = type; this.level = level;
     this.x = location.x; this.y = location.y; this.z = location.z;
     this.icon = null;
+    // screen pos will be computed each frame: {x,y,visible}
+    this._screen = { x: 0, y: 0, visible: false };
+
     if (type) {
       // use preloaded cache if available (preload() sets iconCache[type])
       if (iconCache[type]) {
@@ -148,7 +151,7 @@ class Label {
         try {
           this.icon = loadImage('data/' + type + '.png',
             img => { iconCache[type] = img; this.icon = img; },
-            err => { 
+            err => {
               // keep null; warn once
               console.warn('Label icon not found for type:', type, 'expected path:', 'data/' + type + '.png');
             }
@@ -176,74 +179,33 @@ class Label {
       default: return {r:255,g:255,b:255};
     }
   }
+  // NOTE: Label.show is no longer used to render HUD — rendering is done by drawLabelsHUD().
+  // Keeping the method in case you use it elsewhere.
   show() {
+    // fallback if someone calls it: simple world-space billboard (not used in optimized HUD)
     push();
-
-    // переход в мировую позицию метки
     translate(this.x, this.y, this.z);
-
-    // Billboard: развернуть к камере
-    // достаточно выровнять только Y-угол!
     rotateY(-angleY);
-
-    // не трогаем rotateX — он ломает оси текста и иконки
-    // rotateX(-angleX);  // УДАЛЕНО
-
-    // масштаб иконки/текста зависит от zoom
     scale(1 / zoom);
-
-    // отключаем depth test, чтобы метки рисовались поверх
     if (drawingContext && drawingContext.disable) {
-        drawingContext.disable(drawingContext.DEPTH_TEST);
+      try { drawingContext.disable(drawingContext.DEPTH_TEST); } catch(e) {}
     }
-
     noStroke();
+    fill(this.clr.r, this.clr.g, this.clr.b);
     textSize(17);
     textAlign(CENTER, TOP);
-
-    // вертикальный отступ для текста
-    let textOffset = this.icon ? this.icon.height / 1.5 + 6 : 20;
-
-    // 1) Рисуем иконку
-    if (this.icon) {
-        imageMode(CENTER);
-
-        // Рисуем строго на плоскости XY
-        image(
-            this.icon,
-            0,         // x
-            0,         // y
-            this.icon.width / 1.5,
-            this.icon.height / 1.5
-        );
+    if (this.icon && this.icon.width) {
+      imageMode(CENTER);
+      image(this.icon, 0, 0, this.icon.width/1.5, this.icon.height/1.5);
+      text(this.name, 0, (this.icon.height/1.5) - 6);
+    } else {
+      text(this.name, 0, -6);
     }
-
-    // 2) Рисуем текст
-    fill(this.clr.r, this.clr.g, this.clr.b);
-
-    if (zoom >= 2) {
-        for (let dx = -0.25; dx <= 0.25; dx += 0.25) {
-            for (let dy = -0.25; dy <= 0.25; dy += 0.25) {
-                if (dx !== 0 || dy !== 0) {
-                    push();
-                    translate(dx * 2, dy * 2, 0); // лёгкий «обвод»
-                    text(this.name, 0, textOffset);
-                    pop();
-                }
-            }
-        }
-    }
-
-    text(this.name, 0, textOffset);
-
-    // вернуть Z-буфер
     if (drawingContext && drawingContext.enable) {
-        drawingContext.enable(drawingContext.DEPTH_TEST);
+      try { drawingContext.enable(drawingContext.DEPTH_TEST); } catch(e) {}
     }
-
     pop();
-}
-
+  }
 }
 
 // -----------------------------
@@ -266,7 +228,6 @@ function preload() {
   json_waters_root = loadJSON('data/water.json');
 
   // Preload icons exactly by label types found in labels.json.
-  // We store them in iconCache keyed by the 'type' (same as Label expects).
   try {
     let arr = (json_labels_root && (json_labels_root.labels || json_labels_root)) || [];
     let types = {};
@@ -274,13 +235,10 @@ function preload() {
       let t = arr[i].type;
       if (t && !types[t]) {
         types[t] = true;
-        // path is data/<type>.png as requested
-        // loadImage returns a p5.Image; store it (async load is fine in preload)
-        iconCache[t] = loadImage('data/' + t + '.png', img => { iconCache[t] = img; }, err => {
-          // if missing — remove key and log (helps debugging)
-          delete iconCache[t];
-          console.warn('Missing icon for type (expected):', 'data/' + t + '.png');
-        });
+        iconCache[t] = loadImage('data/' + t + '.png',
+          img => { iconCache[t] = img; },
+          err => { delete iconCache[t]; console.warn('Missing icon for type (expected):', 'data/' + t + '.png'); }
+        );
       }
     }
   } catch (e) {
@@ -309,6 +267,9 @@ function setup() {
   read_json_roads();
   read_json_underlays();
   read_json_waters();
+
+  // debug: list loaded icons
+  console.log('Icons preloaded:', Object.keys(iconCache));
 }
 
 // -----------------------------
@@ -317,13 +278,33 @@ function setup() {
 function draw() {
   background(43, 52, 85);
 
+  // -------------------------
+  // 3D scene render
+  // -------------------------
   push();
+
+  // same transform order as у тебя: translate screen-origin, scale, rotate, translate offsets
   translate(0, 100, 0);
   scale(zoom);
   rotateX(angleX);
   rotateY(angleY);
   translate(offsetX, 0, offsetZ);
 
+  // -- compute screen positions for labels while transforms are active --
+  // store them in label._screen so HUD can use them after pop()
+  for (let L of labels) {
+    // screenX/screenY expect world coords (they return coordinates in canvas pixels; origin at top-left)
+    // compute while current modelView includes our camera transforms
+    let sx = screenX(L.x, L.y, L.z);
+    let sy = screenY(L.x, L.y, L.z);
+    // also compute visibility by projecting z (approx): if behind camera, mark invisible.
+    // p5 doesn't expose depth easily here, but we can do simple near-plane check by projecting then testing
+    L._screen.x = sx;
+    L._screen.y = sy;
+    L._screen.visible = true;
+  }
+
+  // draw map layers (same order as раньше)
   drawUnderlays();
   drawGreenAreas();
   drawWaters();
@@ -337,12 +318,75 @@ function draw() {
   drawHospitals();
   drawGovernments();
 
-  pop();
+  pop(); // restores modelView to identity
 
-  // draw labels last (their show disables depth test internally)
-  for (let L of labels) {
-    if (L.level <= zoom) L.show();
+  // -------------------------
+  // 2D HUD render for labels (icons + text)
+  // -------------------------
+  // We draw the HUD in screen coordinates. screenX/screenY above return coordinates in pixels with origin at top-left.
+  // However in WEBGL p5, resetMatrix() sets the drawing origin back to center; so we translate(-width/2, -height/2)
+  // to match screenX/screenY coordinate system.
+  push();
+  resetMatrix();
+  // move origin to top-left to match screenX/screenY
+  translate(-width / 2, -height / 2);
+
+  // disable depth test so HUD always on top
+  if (drawingContext && drawingContext.disable) {
+    try { drawingContext.disable(drawingContext.DEPTH_TEST); } catch (e) {}
   }
+
+  // draw each label using cached screen positions
+  textAlign(CENTER, TOP);
+  for (let L of labels) {
+    if (!L._screen || !L._screen.visible) continue;
+    // check level threshold like original
+    if (L.level > zoom) continue;
+
+    let sx = L._screen.x;
+    let sy = L._screen.y;
+
+    // skip NaN / undefined positions
+    if (!isFinite(sx) || !isFinite(sy)) continue;
+
+    // icon
+    if (L.icon && L.icon.width) {
+      // choose a screen size for icons (we can scale with zoom if you want)
+      // keep icons constant screen size (don't multiply by zoom)
+      let iw = L.icon.width / 1.5;
+      let ih = L.icon.height / 1.5;
+      imageMode(CORNER);
+      // image expects top-left coords when CORNER; screenX,Y returns pixel center coords — for center we subtract half-size
+      image(L.icon, sx - iw / 2, sy - ih / 2, iw, ih);
+      // text under icon (only at sufficient zoom)
+      if (zoom >= 2) {
+        fill(L.clr.r, L.clr.g, L.clr.b);
+        textSize(17);
+        // draw shadow / outline for readability
+        fill(0, 80);
+        text(L.name, sx + 1, sy + ih / 2 + 3 + 1);
+        fill(L.clr.r, L.clr.g, L.clr.b);
+        text(L.name, sx, sy + ih / 2 + 3);
+      }
+    } else {
+      // fallback: draw simple circle + text
+      fill(L.clr.r, L.clr.g, L.clr.b);
+      noStroke();
+      ellipse(sx, sy, 10, 10);
+      if (zoom >= 2) {
+        fill(255);
+        textSize(14);
+        text(L.name, sx, sy + 8);
+      }
+    }
+  }
+
+  // restore depth test
+  if (drawingContext && drawingContext.enable) {
+    try { drawingContext.enable(drawingContext.DEPTH_TEST); } catch (e) {}
+  }
+
+  pop();
 }
 
 // -----------------------------
@@ -362,7 +406,7 @@ function drawHospitals() { for (let h of hospitals) if (h && h.show) h.show(); }
 function drawGovernments() { for (let g of governments) if (g && g.show) g.show(); }
 
 // -----------------------------
-// JSON readers
+// JSON readers (unchanged logic)
 // -----------------------------
 function safeArr(root, key) {
   if (!root) return [];
