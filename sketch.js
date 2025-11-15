@@ -1,4 +1,4 @@
-// main.js — полный перевод Processing -> p5.js (WEBGL)
+// main.js — исправленный полный вариант (твой код + баг-фиксы)
 
 // -----------------------------
 // Global state
@@ -37,7 +37,7 @@ let waters = [];
 let iconCache = {};
 
 // -----------------------------
-// Classes
+// Classes (как в твоём варианте)
 // -----------------------------
 class Point {
   constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
@@ -140,10 +140,22 @@ class Label {
     this.x = location.x; this.y = location.y; this.z = location.z;
     this.icon = null;
     if (type) {
-      if (iconCache[type]) this.icon = iconCache[type];
-      else {
-        // load image and store; loadImage is safe to call outside preload but may flash
-        this.icon = loadImage('data/' + type + '.png', img => { iconCache[type] = img; }, err => { /* ignore */ });
+      // use preloaded cache if available (preload() sets iconCache[type])
+      if (iconCache[type]) {
+        this.icon = iconCache[type];
+      } else {
+        // fallback: try to load (async). We'll log if missing.
+        try {
+          this.icon = loadImage('data/' + type + '.png',
+            img => { iconCache[type] = img; this.icon = img; },
+            err => { 
+              // keep null; warn once
+              console.warn('Label icon not found for type:', type, 'expected path:', 'data/' + type + '.png');
+            }
+          );
+        } catch (e) {
+          console.warn('loadImage failed for label type', type, e);
+        }
       }
     }
     this.clr = this.colorForType(type);
@@ -165,15 +177,17 @@ class Label {
     }
   }
   show() {
-    // transform to label position in world, then draw 2D-like icon+text without depth testing
     push();
+    // position label in world
     translate(this.x, this.y, this.z);
     rotateY(-angleY);
     rotateX(-angleX);
     scale(1/zoom);
 
-    // disable depth test
-    if (drawingContext && drawingContext.disable) drawingContext.disable(drawingContext.DEPTH_TEST);
+    // disable depth test to draw icon/text on top
+    if (drawingContext && drawingContext.disable) {
+      try { drawingContext.disable(drawingContext.DEPTH_TEST); } catch(e){ /* ignore */ }
+    }
 
     noStroke();
     fill(this.clr.r, this.clr.g, this.clr.b);
@@ -185,20 +199,26 @@ class Label {
         for (let dy = -0.25; dy <= 0.25; dy += 0.25) {
           if (dx !== 0 || dy !== 0) {
             push(); translate(dx, dy, 0);
-            if (this.icon) text(this.name, 0, this.icon.height - 15); else text(this.name, 0, -15);
+            if (this.icon && this.icon.width) text(this.name, 0, this.icon.height - 15); else text(this.name, 0, -15);
             pop();
           }
         }
       }
-      if (this.icon) text(this.name, 0, this.icon.height - 15); else text(this.name, 0, -15);
+      if (this.icon && this.icon.height) text(this.name, 0, this.icon.height - 15); else text(this.name, 0, -15);
     }
 
-    if (this.icon) {
+    if (this.icon && this.icon.width) {
       imageMode(CENTER);
-      image(this.icon, 0, 0, this.icon.width / 1.5, this.icon.height / 1.5);
+      // safeguard icon sizes
+      let iw = (this.icon.width || 32) / 1.5;
+      let ih = (this.icon.height || 32) / 1.5;
+      image(this.icon, 0, 0, iw, ih);
     }
 
-    if (drawingContext && drawingContext.enable) drawingContext.enable(drawingContext.DEPTH_TEST);
+    // restore depth test
+    if (drawingContext && drawingContext.enable) {
+      try { drawingContext.enable(drawingContext.DEPTH_TEST); } catch(e){ /* ignore */ }
+    }
 
     scale(zoom);
     pop();
@@ -206,10 +226,10 @@ class Label {
 }
 
 // -----------------------------
-// preload - load JSON and icons referenced in labels
+// preload - load JSON and icons mentioned in labels
 // -----------------------------
 function preload() {
-  // load JSONs
+  // load JSONs (paths same as в твоём проекте)
   json_alleys_root = loadJSON('data/alleys.json');
   json_buildings_root = loadJSON('data/buildings.json');
   json_detalised_buildings_root = loadJSON('data/detalised_buildings.json');
@@ -224,7 +244,8 @@ function preload() {
   json_underlays_root = loadJSON('data/underlays.json');
   json_waters_root = loadJSON('data/water.json');
 
-  // pre-load icons mentioned in labels.json (if exists)
+  // Preload icons exactly by label types found in labels.json.
+  // We store them in iconCache keyed by the 'type' (same as Label expects).
   try {
     let arr = (json_labels_root && (json_labels_root.labels || json_labels_root)) || [];
     let types = {};
@@ -232,11 +253,18 @@ function preload() {
       let t = arr[i].type;
       if (t && !types[t]) {
         types[t] = true;
-        // attempt to preload icon; if missing, loadImage will fail silently
-        iconCache[t] = loadImage('data/' + t + '.png', img => { iconCache[t] = img; }, err => { delete iconCache[t]; });
+        // path is data/<type>.png as requested
+        // loadImage returns a p5.Image; store it (async load is fine in preload)
+        iconCache[t] = loadImage('data/' + t + '.png', img => { iconCache[t] = img; }, err => {
+          // if missing — remove key and log (helps debugging)
+          delete iconCache[t];
+          console.warn('Missing icon for type (expected):', 'data/' + t + '.png');
+        });
       }
     }
-  } catch (e) { /* ignore */ }
+  } catch (e) {
+    console.warn('Failed to pre-load icons from labels.json', e);
+  }
 }
 
 // -----------------------------
@@ -299,28 +327,26 @@ function draw() {
 // -----------------------------
 // draw layer helpers
 // -----------------------------
-function drawUnderlays() { for (let u of underlays) u.show && u.show(); }
-function drawGreenAreas() { for (let g of green_areas) g.show && g.show(); }
-function drawWaters() { for (let w of waters) w.show && w.show(); }
-function drawParkings() { for (let p of parkings) p.show && p.show(); }
-function drawAlleys() { for (let a of alleys) a.show && a.show(); }
-function drawRailways() { for (let r of railways) r.show && r.show(); }
-function drawRoads() { for (let r of roads) r.show && r.show(); }
-function drawFields() { for (let f of fields) f.show && f.show(); }
-function drawBuildings() { for (let b of buildings) b.show && b.show(); }
-function drawDetalisedBuildings() { for (let d of detalised_buildings) d.show && d.show(); }
-function drawHospitals() { for (let h of hospitals) h.show && h.show(); }
-function drawGovernments() { for (let g of governments) g.show && g.show(); }
+function drawUnderlays() { for (let u of underlays) if (u && u.show) u.show(); }
+function drawGreenAreas() { for (let g of green_areas) if (g && g.show) g.show(); }
+function drawWaters() { for (let w of waters) if (w && w.show) w.show(); }
+function drawParkings() { for (let p of parkings) if (p && p.show) p.show(); }
+function drawAlleys() { for (let a of alleys) if (a && a.show) a.show(); }
+function drawRailways() { for (let r of railways) if (r && r.show) r.show(); }
+function drawRoads() { for (let r of roads) if (r && r.show) r.show(); }
+function drawFields() { for (let f of fields) if (f && f.show) f.show(); }
+function drawBuildings() { for (let b of buildings) if (b && b.show) b.show(); }
+function drawDetalisedBuildings() { for (let d of detalised_buildings) if (d && d.show) d.show(); }
+function drawHospitals() { for (let h of hospitals) if (h && h.show) h.show(); }
+function drawGovernments() { for (let g of governments) if (g && g.show) g.show(); }
 
 // -----------------------------
 // JSON readers
-// (handles both root-array and root-object-with-key cases)
 // -----------------------------
 function safeArr(root, key) {
   if (!root) return [];
   if (root[key]) return root[key];
   if (Array.isArray(root)) return root;
-  // if root is object with unknown shape, try to find first array value
   for (let k in root) if (Array.isArray(root[k])) return root[k];
   return [];
 }
@@ -471,12 +497,14 @@ function read_json_waters() {
 }
 
 // -----------------------------
-// Input: mouse & touch
+// Input: mouse & touch (исправления)
 // -----------------------------
 
 // DESKTOP: left drag = pan; CTRL + drag = rotate
 function mouseDragged() {
-  if (isTouch) return; // ignore mouse while touch active
+  // If we're currently handling a real touch, ignore mouse drags
+  if (isTouch) return;
+
   let dx = mouseX - pmouseX;
   let dy = mouseY - pmouseY;
   let sensitivity = 1.0 / zoom;
@@ -494,6 +522,7 @@ function mouseDragged() {
 
 // mouseWheel: zoom and keep focus under cursor
 function mouseWheel(event) {
+  // ignore mouse wheel if real touch is active (some devices send both)
   if (isTouch) return;
   let e = (event.delta > 0) ? 1 : -1;
   let oldZoom = zoom;
@@ -523,8 +552,12 @@ let startOffsetX = 0;
 let startOffsetZ = 0;
 let lastAngleBetween = 0;
 
-function touchStarted() {
+function touchStarted(event) {
+  // only treat as touch if touches array actually contains pointers
+  if (!touches || touches.length === 0) return;
+
   isTouch = true;
+
   if (touches.length === 1) {
     touchMode = "pan";
     lastPanX = touches[0].x;
@@ -543,6 +576,9 @@ function touchStarted() {
 }
 
 function touchMoved() {
+  // ensure it's a real touch move
+  if (!touches || touches.length === 0) return false;
+
   if (touchMode === "pan" && touches.length === 1) {
     let dx = touches[0].x - lastPanX;
     let dy = touches[0].y - lastPanZ;
@@ -576,11 +612,10 @@ function touchMoved() {
 }
 
 function touchEnded() {
-  if (touches.length === 0) {
+  if (!touches || touches.length === 0) {
     isTouch = false;
     touchMode = "none";
   } else if (touches.length === 1) {
-    // if one finger left, switch to pan start from current
     touchMode = "pan";
     lastPanX = touches[0].x; lastPanZ = touches[0].y;
     startOffsetX = offsetX; startOffsetZ = offsetZ;
