@@ -9,7 +9,7 @@ let angleY = 0;
 
 let font;
 
-let colors = {};
+let colors = {}; 
 
 let alleys = [], buildings = [], detalised_buildings = [], fields = [], governments = [];
 let green_areas = [], hospitals = [], labels = [], parkings = [], railways = [], roads = [], underlays = [], waters = [];
