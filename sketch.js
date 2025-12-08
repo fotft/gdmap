@@ -1,5 +1,5 @@
 // grdkmap.js — p5.js версия (2025)
- 
+
 let theme = "light";
 let zoom = 1;
 let offsetX = 0;
